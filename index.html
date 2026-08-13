@@ -443,14 +443,73 @@
   function registerStoreFlow(prefillName){
     var name = prompt("店舗名を入力してください(例: イオン ○○店)", prefillName || "");
     if(!name) return;
-    var url = prompt("その店舗のチラシページのURLを入力してください\n(店舗ごとに異なるので、実際にブラウザで開いて確認したURLを貼り付けてください)");
-    if(!url) return;
-    state.stores.push({ id:uid(), name:name.trim(), url:url.trim() });
+    name = name.trim();
+    var area = prompt("店舗のある地域(市区町村など、分かる範囲でOK)\n※検索の精度が上がります", "");
+
+    var doManualEntry = function(){
+      var url = prompt("チラシページのURLを入力してください\n(実際にブラウザで開いて確認したURLを貼り付けてください)");
+      if(!url) return;
+      saveStore(name, url.trim());
+    };
+
+    if(!state.gasUrl){
+      doManualEntry();
+      return;
+    }
+
+    toast("チラシページを検索中...");
+    var endpoint = state.gasUrl + (state.gasUrl.indexOf("?")>-1 ? "&" : "?") +
+      "action=findStoreUrl&name=" + encodeURIComponent(name) + "&area=" + encodeURIComponent(area||"");
+
+    fetch(endpoint)
+      .then(function(res){ return res.json(); })
+      .then(function(data){
+        if(data.ok && data.url){
+          var ok = confirm(name+" のチラシページ候補が見つかりました:\n\n"+data.url+"\n\nこのURLで登録しますか？\n(キャンセルすると手動でURLを入力できます)");
+          if(ok){ saveStore(name, data.url); }
+          else{ doManualEntry(); }
+        } else {
+          toast("見つかりませんでした。手動で入力してください");
+          doManualEntry();
+        }
+      })
+      .catch(function(){
+        toast("検索に失敗しました。手動で入力してください");
+        doManualEntry();
+      });
+  }
+
+  function saveStore(name, url){
+    state.stores.push({ id:uid(), name:name, url:url });
     persist("stores", state.stores);
     chainSearchInput.value = "";
     chainSearchResults.innerHTML = "";
     renderStoreList();
     toast(name+" を登録しました");
+  }
+
+  function researchStoreUrl(store){
+    if(!state.gasUrl){ toast("先に設定タブでGASのURLを登録してください"); return; }
+    var area = prompt("店舗のある地域(市区町村など)を入力してください(任意)", "");
+    toast("チラシページを再検索中...");
+    var endpoint = state.gasUrl + (state.gasUrl.indexOf("?")>-1 ? "&" : "?") +
+      "action=findStoreUrl&name=" + encodeURIComponent(store.name) + "&area=" + encodeURIComponent(area||"");
+    fetch(endpoint)
+      .then(function(res){ return res.json(); })
+      .then(function(data){
+        if(data.ok && data.url){
+          var ok = confirm("新しい候補:\n\n"+data.url+"\n\nこのURLに更新しますか？");
+          if(ok){
+            store.url = data.url;
+            persist("stores", state.stores);
+            renderStoreList();
+            toast("URLを更新しました");
+          }
+        } else {
+          toast("候補が見つかりませんでした");
+        }
+      })
+      .catch(function(){ toast("検索に失敗しました"); });
   }
 
   function renderStoreList(){
@@ -475,6 +534,11 @@
         renderStoreList();
       });
       row.appendChild(delBtn);
+      var researchBtn = document.createElement("button");
+      researchBtn.className = "icon-btn";
+      researchBtn.textContent = "URL再検索";
+      researchBtn.addEventListener("click", function(){ researchStoreUrl(s); });
+      row.appendChild(researchBtn);
       box.appendChild(row);
     });
   }
