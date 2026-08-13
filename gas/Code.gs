@@ -80,7 +80,9 @@ function findStoreFlyerUrl(name, area) {
   var query = area ? (area + " " + name) : name;
   var prompt =
     "日本のスーパーマーケット「" + query + "」の、本日または今週の特売チラシが見られる" +
-    "公式サイトのチラシページ、またはトクバイ・Shufoo!等のチラシ掲載サービスのページを1つ探してください。\n" +
+    "ページを1つ探してください。特に shufoo.net(シュフー)は多くのスーパーのチラシを" +
+    "掲載しているため、対象店舗が載っていればそちらのページを優先してください。" +
+    "掲載がなければ公式サイトのチラシページや他のチラシ掲載サービスでも構いません。\n" +
     "見つけたら次のJSON形式のみで回答してください(説明文・コードブロック不要):\n" +
     '{"url":"https://...","source":"サイト名"}\n' +
     "複数の店舗がヒットする場合は、店名・地域から最も一致度が高いと思われる1件を選んでください。" +
@@ -131,42 +133,94 @@ function extractUrlFromGroundedResponse(data) {
  * URLからHTMLを取得し、ドメインに応じたパーサーで特売情報を抽出する
  */
 function fetchSaleItems(url) {
-  var res = UrlFetchApp.fetch(url, {
-    muteHttpExceptions: true,
-    followRedirects: true,
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-    }
-  });
-  if (res.getResponseCode() >= 400) {
-    throw new Error("ページの取得に失敗しました (HTTP " + res.getResponseCode() + ")");
-  }
-
-  var contentType = (res.getHeaders()["Content-Type"] || res.getHeaders()["content-type"] || "").toLowerCase();
   var domain = extractDomain(url);
-  var items;
+  var parser = DOMAIN_PARSERS[domain];
+  var items = null;
 
-  if (contentType.indexOf("image/") === 0 || contentType.indexOf("application/pdf") === 0) {
-    // チラシが画像/PDFで配信されているサイト向け: Geminiに直接読ませる
-    items = geminiExtractFromBlob(res.getBlob(), contentType);
-  } else {
-    var html = res.getContentText();
-    var parser = DOMAIN_PARSERS[domain];
-    if (parser) {
-      items = parser(html, url);
-    } else {
-      items = geminiExtractFromHtml(html);
-    }
+  if (parser) {
+    // ドメイン専用パーサーがあれば最優先(無料・高速)
+    var res0 = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
+    items = parser(res0.getContentText(), url);
   }
 
   if (!items || items.length === 0) {
-    // Gemini未設定/失敗時、またはヒットなしの場合の最終フォールバック
-    var fallbackHtml = contentType.indexOf("text/html") > -1 || !contentType ? res.getContentText() : "";
-    if (fallbackHtml) items = genericParser(fallbackHtml);
+    // Gemini + url_context: URLをそのままGeminiに渡し、Google側で取得・解析させる
+    // (JavaScriptで描画されるチラシビューアーにも、自前fetchより強い場合がある)
+    items = geminiExtractViaUrlContext(url);
+  }
+
+  if (!items || items.length === 0) {
+    // 自前でページを取得し、画像/PDFならVision、HTMLならテキスト解析
+    var res = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true,
+      followRedirects: true,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+      }
+    });
+    if (res.getResponseCode() >= 400) {
+      throw new Error("ページの取得に失敗しました (HTTP " + res.getResponseCode() + ")");
+    }
+    var contentType = (res.getHeaders()["Content-Type"] || res.getHeaders()["content-type"] || "").toLowerCase();
+
+    if (contentType.indexOf("image/") === 0 || contentType.indexOf("application/pdf") === 0) {
+      items = geminiExtractFromBlob(res.getBlob(), contentType);
+    } else {
+      var html = res.getContentText();
+      items = geminiExtractFromHtml(html);
+      if (!items || items.length === 0) {
+        items = genericParser(html); // 最終フォールバック
+      }
+    }
   }
 
   // 上限をかけて返す(表示崩れ防止)
   return (items || []).slice(0, 60);
+}
+
+/**
+ * URLをそのままGeminiに渡し、url_context機能で取得・解析させる。
+ * JavaScriptで描画されるページ(チラシビューアー等)でも、
+ * Google側のインデックス/レンダリングを介するため成功する場合がある。
+ * ただしcanvasに直接描画されるタイプの電子チラシは、これでも取得できないことがある
+ * (その場合は下位のフォールバックに自動的に進む)。
+ */
+function geminiExtractViaUrlContext(url) {
+  var apiKey = getGeminiApiKey();
+  if (!apiKey) return null;
+
+  var prompt =
+    "次のURLのページを読み、日本のスーパーマーケットの本日または今週の特売商品情報を抽出してください: " + url + "\n" +
+    "商品名と価格が読み取れるものだけを、次のJSON配列だけで出力してください(説明文・コードブロック不要)。\n" +
+    '[{"name":"商品名","price":数値(円),"unit":"単位表記があれば(なければ空文字)"}]\n' +
+    "ページの内容が読み取れない、または特売情報が見つからない場合は空配列 [] を返してください。";
+
+  var endpoint = "https://generativelanguage.googleapis.com/v1beta/models/" +
+    GEMINI_MODEL + ":generateContent?key=" + apiKey;
+  var payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    tools: [{ url_context: {} }]
+  };
+
+  var res = UrlFetchApp.fetch(endpoint, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() >= 400) return null;
+
+  try {
+    var data = JSON.parse(res.getContentText());
+    var text = data.candidates[0].content.parts.map(function (p) { return p.text || ""; }).join("");
+    text = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+    var parsed = JSON.parse(text);
+    return parsed.filter(function (it) {
+      return it && it.name && typeof it.price === "number" && it.price > 0;
+    });
+  } catch (e) {
+    return null;
+  }
 }
 
 /**
